@@ -129,52 +129,83 @@ func Run(args []string, tty terminal.Terminal) int {
 			}
 		}()
 
+		inputs := make([]lib.Input, len(files))
+		for i, f := range files {
+			inputs[i] = libInput(f)
+		}
+
+		var parseResult *lib.ParseResult
 		if *dumpPem {
 			dumped := 0
-			err = lib.ReadAsPEMFromFiles(files, *dumpType, tty.ReadPassword, func(block *pem.Block, format string) error {
+			parseResult, err = lib.ReadPEMInputs(inputs, *dumpType, tty.ReadPassword, func(block *pem.Block, src lib.Source) error {
+				// --first is a display choice, not a parse stop: remaining
+				// blocks keep being consumed so truncation later in the
+				// input is still reported.
 				if *dumpFirst && dumped > 0 {
 					return nil
 				}
-
 				block.Headers = nil
 				dumped++
 				return pem.Encode(stdout, block)
 			})
-		} else {
-			err = lib.ReadAsX509FromFiles(files, *dumpType, tty.ReadPassword, func(cert *x509.Certificate, format string, err error) error {
-				if err != nil {
-					//nolint:staticcheck // See errorFromErrors
-					return fmt.Errorf("error parsing block: %s\n", strings.TrimSuffix(err.Error(), "\n"))
-				} else {
-					result.Certificates = append(result.Certificates, cert)
-					result.Formats = append(result.Formats, format)
-				}
-				return nil
-			})
-
-			certList := result.Certificates
-			formatList := result.Formats
-			if *dumpFirst && len(certList) > 0 {
-				certList = certList[:1]
-				formatList = formatList[:1]
-				result.Certificates = certList
-				result.Formats = formatList
+			if err == nil {
+				err = parseResult.Error()
 			}
+			if err != nil {
+				return printErr("error: %s\n", strings.TrimSuffix(err.Error(), "\n"))
+			}
+			return 0
+		}
 
-			if *dumpJSON {
-				blob, _ := json.Marshal(result)
-				_, _ = fmt.Println(string(blob))
-			} else {
-				for i, cert := range result.Certificates {
-					_, _ = fmt.Fprintf(stdout, "** CERTIFICATE %d **\n", i+1)
-					_, _ = fmt.Fprintf(stdout, "Input Format: %s\n", result.Formats[i])
-					_, _ = fmt.Fprintf(stdout, "%s\n\n", lib.EncodeX509ToText(cert, terminalWidth, *verbose))
-				}
+		parseResult, err = lib.ReadX509Inputs(inputs, *dumpType, tty.ReadPassword, func(cert *x509.Certificate, src lib.Source, parseBlockErr error) error {
+			// Parse failures are recorded on parseResult; keep collecting
+			// successfully parsed certificates as partial results.
+			if parseBlockErr != nil {
+				return nil
+			}
+			result.Certificates = append(result.Certificates, cert)
+			result.Formats = append(result.Formats, src.Format)
+			return nil
+		})
+
+		// --first only filters what is displayed; the parse result always
+		// covers every input.
+		certList := result.Certificates
+		formatList := result.Formats
+		if *dumpFirst && len(certList) > 0 {
+			certList = certList[:1]
+			formatList = formatList[:1]
+		}
+
+		parseErr := err
+		if parseErr == nil {
+			parseErr = parseResult.Error()
+		}
+		result.ParseResult = parseResult
+		if parseErr != nil {
+			result.Error = strings.TrimSuffix(parseErr.Error(), "\n")
+		}
+
+		if *dumpJSON {
+			// Always emit exactly one JSON object, even for partial results.
+			display := result
+			display.Certificates = certList
+			blob, marshalErr := json.Marshal(display)
+			if marshalErr != nil {
+				return printErr("error: %s\n", marshalErr.Error())
+			}
+			_, _ = fmt.Fprintln(stdout, string(blob))
+		} else {
+			for i, cert := range certList {
+				_, _ = fmt.Fprintf(stdout, "** CERTIFICATE %d **\n", i+1)
+				_, _ = fmt.Fprintf(stdout, "Input Format: %s\n", formatList[i])
+				_, _ = fmt.Fprintf(stdout, "%s\n\n", lib.EncodeX509ToText(cert, terminalWidth, *verbose))
 			}
 		}
-		if err != nil {
-			return printErr("error: %s\n", strings.TrimSuffix(err.Error(), "\n"))
-		} else if len(result.Certificates) == 0 && !*dumpPem {
+
+		if parseErr != nil {
+			return printErr("error: %s\n", result.Error)
+		} else if len(result.Certificates) == 0 {
 			printErr("warning: no certificates found in input\n")
 		}
 
@@ -225,7 +256,7 @@ func Run(args []string, tty terminal.Terminal) int {
 
 		if *connectJSON {
 			blob, _ := json.Marshal(result)
-			_, _ = fmt.Println(string(blob))
+			_, _ = fmt.Fprintln(stdout, string(blob))
 		} else if !*connectPem {
 			_, _ = fmt.Fprintf(
 				stdout, "%s\n\n",
@@ -253,22 +284,50 @@ func Run(args []string, tty terminal.Terminal) int {
 		defer func() { _ = file.Close() }()
 
 		var chain []*x509.Certificate
-		err = lib.ReadAsX509FromFiles([]*os.File{file}, *verifyType, tty.ReadPassword, func(cert *x509.Certificate, format string, err error) error {
-			if err != nil {
-				return err
-			} else {
-				chain = append(chain, cert)
-			}
-			return nil
-		})
-		if err != nil {
-			return printErr("error parsing block: %s\n", strings.TrimSuffix(err.Error(), "\n"))
+		parseResult, parseErr := lib.ReadX509Inputs(
+			[]lib.Input{libInput(file)}, *verifyType, tty.ReadPassword,
+			func(cert *x509.Certificate, src lib.Source, certParseErr error) error {
+				if certParseErr == nil && cert != nil {
+					chain = append(chain, cert)
+				}
+				return nil
+			})
+		if parseErr != nil {
+			parseErr = fmt.Errorf("error reading input: %w", parseErr)
+		} else {
+			parseErr = parseResult.Error()
 		}
 
-		verifyResult := lib.VerifyChain(chain, nil, *verifyName, *verifyCaPath)
+		// Only enter the trust decision when chain and CA inputs were
+		// parsed in full.
+		var roots *x509.CertPool
+		if parseErr == nil {
+			var caParseResult *lib.ParseResult
+			roots, caParseResult, parseErr = lib.LoadRoots(*verifyCaPath)
+			if parseErr != nil && caParseResult != nil {
+				parseResult.Inputs = append(parseResult.Inputs, caParseResult.Inputs...)
+			}
+		}
+
+		if parseErr != nil {
+			if *verifyJSON {
+				// A single, parseable JSON object even for failed parses.
+				blob, _ := json.Marshal(struct {
+					Error       string           `json:"error"`
+					ParseResult *lib.ParseResult `json:"parse_result"`
+				}{strings.TrimSuffix(parseErr.Error(), "\n"), parseResult})
+				_, _ = fmt.Fprintln(stdout, string(blob))
+			} else {
+				return printErr("error: %s\n", strings.TrimSuffix(parseErr.Error(), "\n"))
+			}
+			return 2
+		}
+
+		verifyResult := lib.VerifyChainWithRoots(chain, nil, *verifyName, roots)
+		verifyResult.ParseResult = parseResult
 		if *verifyJSON {
 			blob, _ := json.Marshal(verifyResult)
-			_, _ = fmt.Println(string(blob))
+			_, _ = fmt.Fprintln(stdout, string(blob))
 		} else {
 			lib.PrintVerifyResult(stdout, verifyResult)
 		}
@@ -277,6 +336,16 @@ func Run(args []string, tty terminal.Terminal) int {
 		}
 	}
 	return 0
+}
+
+// libInput converts an open file to a lib.Input; stdin is reported as an
+// unnamed stream.
+func libInput(file *os.File) lib.Input {
+	name := file.Name()
+	if file == os.Stdin || name == os.Stdin.Name() {
+		name = ""
+	}
+	return lib.Input{Name: name, Reader: file}
 }
 
 func inputFile(fileName string) (*os.File, error) {

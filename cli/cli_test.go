@@ -16,10 +16,13 @@
 package cli
 
 import (
+	"bytes"
 	"crypto/tls"
+	"encoding/json"
 	"net/http"
 	"net/http/httptest"
 	"os"
+	"path/filepath"
 	"regexp"
 	"testing"
 
@@ -183,8 +186,30 @@ Found 1 valid certificate chain(s):
 	=> CN=Localhost Root [self-signed]
 `
 
+// resetDumpFlags clears kingpin's package-global dump flags, whose values
+// persist across multiple Run calls in the same test process (in particular
+// the positional file slice accumulates across parses).
+func resetDumpFlags() {
+	*dumpFiles = nil
+	*dumpType = ""
+	*dumpJSON = false
+	*dumpPem = false
+	*dumpFirst = false
+}
+
+// resetVerifyFlags clears the package-global verify flags for the same
+// reason as resetDumpFlags.
+func resetVerifyFlags() {
+	*verifyFile = ""
+	*verifyType = ""
+	*verifyName = ""
+	*verifyCaPath = ""
+	*verifyJSON = false
+}
+
 // Test basic dump functionality:  Dump a cert
 func TestDump(t *testing.T) {
+	resetDumpFlags()
 	tmpfile, err := os.CreateTemp("", t.Name())
 	require.NoError(t, err)
 	defer os.Remove(tmpfile.Name())
@@ -201,6 +226,7 @@ func TestDump(t *testing.T) {
 }
 
 func TestDumpMissingFile(t *testing.T) {
+	resetDumpFlags()
 	testTerminal := terminal.TestTerminal{Width: 80}
 	args := []string{"dump", "this-is-a-file-that-definitely-does-not-exist1111.pem"}
 	assert.EqualValues(t, 2, Run(args, &testTerminal), "process should exit 0")
@@ -233,6 +259,148 @@ func TestConnect(t *testing.T) {
 
 	out := cipherSuiteRegex.ReplaceAllLiteralString(testTerminal.OutputBuf.String(), cipherSuiteRepl)
 	assert.EqualValues(t, expectedConnect, out)
+}
+
+const truncatedBlock = "\n-----BEGIN CERTIFICATE-----\nMIIBrokenTruncatedBlockWithoutEndLine\n"
+
+// writeTempCert writes data to a temporary *.pem file and returns its path.
+func writeTempCert(t *testing.T, data []byte) string {
+	t.Helper()
+	path := filepath.Join(t.TempDir(), "input.pem")
+	require.NoError(t, os.WriteFile(path, data, 0o600))
+	return path
+}
+
+// parseSingleJSONObject fails the test if the output is not a single JSON
+// object (possibly followed by a trailing newline).
+func parseSingleJSONObject(t *testing.T, raw []byte) map[string]any {
+	t.Helper()
+	var object map[string]any
+	require.NoError(t, json.Unmarshal(raw, &object), "output must be a single parseable JSON object: %q", raw)
+	dec := json.NewDecoder(bytes.NewReader(raw))
+	require.NoError(t, dec.Decode(&object))
+	require.False(t, dec.More(), "JSON output must contain exactly one object")
+	return object
+}
+
+func TestDumpTruncatedInputJSON(t *testing.T) {
+	resetDumpFlags()
+	t.Cleanup(resetDumpFlags)
+	// One valid certificate followed by a truncated block.
+	path := writeTempCert(t, append(append([]byte{}, localhostCert...), []byte(truncatedBlock)...))
+
+	tt := terminal.TestTerminal{Width: 80}
+	exit := Run([]string{"dump", "--json", path}, &tt)
+	assert.Equal(t, 2, exit)
+	assert.Contains(t, tt.ErrorBuf.String(), "truncated")
+
+	object := parseSingleJSONObject(t, tt.OutputBuf.Bytes())
+	certs, ok := object["certificates"].([]any)
+	require.True(t, ok)
+	assert.Len(t, certs, 1, "valid prefix certificates are still delivered")
+	_, hasError := object["error"]
+	assert.True(t, hasError, "partial result must carry a machine-readable error")
+
+	pr := object["parse_result"].(map[string]any)
+	inputs := pr["inputs"].([]any)
+	require.Len(t, inputs, 1)
+	input := inputs[0].(map[string]any)
+	assert.Equal(t, "incomplete", input["status"])
+	diags := input["diagnostics"].([]any)
+	require.Len(t, diags, 1)
+	diag := diags[0].(map[string]any)
+	assert.Equal(t, "malformed_block", diag["kind"])
+	src := diag["source"].(map[string]any)
+	assert.EqualValues(t, 2, src["block"])
+}
+
+func TestDumpFirstDoesNotMaskParseFailure(t *testing.T) {
+	resetDumpFlags()
+	t.Cleanup(resetDumpFlags)
+	// Two valid certificates, then a truncated block. --first must remain a
+	// display filter and not hide the later parse failure.
+	data := append(append(append([]byte{}, localhostCert...), '\n'), localhostRoot...)
+	data = append(data, []byte(truncatedBlock)...)
+	path := writeTempCert(t, data)
+
+	tt := terminal.TestTerminal{Width: 80}
+	exit := Run([]string{"dump", "--json", "--first", path}, &tt)
+	assert.Equal(t, 2, exit)
+
+	object := parseSingleJSONObject(t, tt.OutputBuf.Bytes())
+	assert.Len(t, object["certificates"].([]any), 1, "--first displays only one certificate")
+	pr := object["parse_result"].(map[string]any)
+	input := pr["inputs"].([]any)[0].(map[string]any)
+	assert.Equal(t, "incomplete", input["status"])
+	positions := input["certificates"].([]any)
+	assert.Len(t, positions, 2, "parse result still records both successfully parsed certificates")
+}
+
+func TestVerifyTruncatedInput(t *testing.T) {
+	resetVerifyFlags()
+	t.Cleanup(resetVerifyFlags)
+	path := writeTempCert(t, append(append([]byte{}, localhostCert...), []byte(truncatedBlock)...))
+
+	// JSON mode: one object on stdout, exit code 2, no trust conclusion.
+	tt := terminal.TestTerminal{Width: 80}
+	exit := Run([]string{"verify", "--json", "--name", "127.0.0.1", path}, &tt)
+	assert.Equal(t, 2, exit)
+	assert.Empty(t, tt.ErrorBuf.String())
+	object := parseSingleJSONObject(t, tt.OutputBuf.Bytes())
+	assert.Contains(t, object["error"], "truncated")
+	pr := object["parse_result"].(map[string]any)
+	input := pr["inputs"].([]any)[0].(map[string]any)
+	assert.Equal(t, "incomplete", input["status"])
+	_, hasChains := object["chains"]
+	assert.False(t, hasChains, "no trust decision may be reported for incomplete input")
+
+	// Text mode: error on stderr, exit code 2.
+	*verifyJSON = false
+	tt2 := terminal.TestTerminal{Width: 80}
+	exit = Run([]string{"verify", "--name", "127.0.0.1", path}, &tt2)
+	assert.Equal(t, 2, exit)
+	assert.Empty(t, tt2.OutputBuf.Bytes())
+	assert.Contains(t, tt2.ErrorBuf.String(), "error:")
+}
+
+func TestVerifySuccessRequiresCompleteParse(t *testing.T) {
+	resetVerifyFlags()
+	t.Cleanup(resetVerifyFlags)
+	chainPath := writeTempCert(t, localhostCert)
+	caPath := writeTempCert(t, localhostRoot)
+
+	tt := terminal.TestTerminal{Width: 80}
+	exit := Run([]string{"verify", "--json", "--name", "127.0.0.1", "--ca", caPath, chainPath}, &tt)
+	assert.Equal(t, 0, exit)
+	assert.Empty(t, tt.ErrorBuf.String())
+	object := parseSingleJSONObject(t, tt.OutputBuf.Bytes())
+	assert.Empty(t, object["error"])
+	assert.NotEmpty(t, object["chains"], "verification should succeed and report chains")
+	pr := object["parse_result"].(map[string]any)
+	for _, raw := range pr["inputs"].([]any) {
+		assert.Equal(t, "complete", raw.(map[string]any)["status"])
+	}
+}
+
+func TestVerifyTruncatedCA(t *testing.T) {
+	resetVerifyFlags()
+	t.Cleanup(resetVerifyFlags)
+	chainPath := writeTempCert(t, localhostCert)
+	badCA := append(append([]byte{}, localhostRoot...), []byte(truncatedBlock)...)
+	caPath := writeTempCert(t, badCA)
+
+	tt := terminal.TestTerminal{Width: 80}
+	exit := Run([]string{"verify", "--json", "--name", "127.0.0.1", "--ca", caPath, chainPath}, &tt)
+	assert.Equal(t, 2, exit)
+	object := parseSingleJSONObject(t, tt.OutputBuf.Bytes())
+	assert.Contains(t, object["error"], "CA bundle")
+	pr := object["parse_result"].(map[string]any)
+	inputs := pr["inputs"].([]any)
+	require.Len(t, inputs, 2)
+	assert.Equal(t, "complete", inputs[0].(map[string]any)["status"])
+	assert.Equal(t, "incomplete", inputs[1].(map[string]any)["status"])
+	_, hasChains := object["chains"]
+	assert.False(t, hasChains, "trust evaluation must not run on a truncated CA bundle")
 }
 
 func TestAppVersion(t *testing.T) {

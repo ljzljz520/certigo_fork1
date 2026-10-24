@@ -43,6 +43,7 @@ type SimpleVerification struct {
 	OCSPWasStapled bool                 `json:"ocsp_was_stapled,omitempty"`
 	OCSPError      string               `json:"ocsp_error,omitempty"`
 	Chains         [][]simpleVerifyCert `json:"chains"`
+	ParseResult    *ParseResult         `json:"parse_result,omitempty"`
 }
 
 type SimpleResult struct {
@@ -51,6 +52,8 @@ type SimpleResult struct {
 	VerifyResult           *SimpleVerification `json:"verify_result,omitempty"`
 	TLSConnectionState     *tls.ConnectionState
 	CertificateRequestInfo *tls.CertificateRequestInfo
+	Error                  string `json:"error,omitempty"`
+	ParseResult            *ParseResult
 }
 
 func (s SimpleResult) MarshalJSON() ([]byte, error) {
@@ -61,6 +64,12 @@ func (s SimpleResult) MarshalJSON() ([]byte, error) {
 
 	out := map[string]interface{}{}
 	out["certificates"] = certs
+	if s.Error != "" {
+		out["error"] = s.Error
+	}
+	if s.ParseResult != nil {
+		out["parse_result"] = s.ParseResult
+	}
 	if s.VerifyResult != nil {
 		out["verify_result"] = s.VerifyResult
 	}
@@ -77,39 +86,62 @@ func (s SimpleResult) MarshalJSON() ([]byte, error) {
 	return json.Marshal(out)
 }
 
-func caBundle(caPath string) (*x509.CertPool, error) {
+// LoadRoots loads a CA bundle and refuses to return roots unless the whole
+// input was parsed successfully. A truncated or malformed CA bundle yields
+// an error (and the structured parse result) so trust decisions are never
+// made on a partial set of roots.
+func LoadRoots(caPath string) (roots *x509.CertPool, result *ParseResult, err error) {
 	if caPath == "" {
-		return nil, nil
+		return nil, nil, nil
 	}
 
-	caFile, err := os.Open(caPath)
-	if err != nil {
-		return nil, fmt.Errorf("error opening CA bundle %s: %w", caPath, err)
+	caFile, openErr := os.Open(caPath)
+	if openErr != nil {
+		return nil, nil, fmt.Errorf("error opening CA bundle %s: %w", caPath, openErr)
 	}
+	defer func() { _ = caFile.Close() }()
 
-	bundle := x509.NewCertPool()
-	err = ReadAsX509FromFiles(
-		[]*os.File{caFile},
+	roots = x509.NewCertPool()
+	result, parseErr := ReadX509Inputs(
+		[]Input{{Name: caPath, Reader: caFile}},
 		"",
 		func(prompt string) string {
 			// TODO: The JDK trust store ships with this password.
 			return "changeit"
 		},
-		func(cert *x509.Certificate, format string, err error) error {
-			if err != nil {
-				return fmt.Errorf("error parsing CA bundle: %w", err)
-			} else {
-				bundle.AddCert(cert)
+		func(cert *x509.Certificate, src Source, parseCertErr error) error {
+			if parseCertErr == nil && cert != nil {
+				roots.AddCert(cert)
 			}
 			return nil
 		})
-	if err != nil {
-		return nil, fmt.Errorf("error parsing CA bundle: %w", err)
+	if parseErr != nil {
+		return nil, result, fmt.Errorf("error parsing CA bundle: %w", parseErr)
 	}
-	return bundle, nil
+	if aggErr := result.Error(); aggErr != nil {
+		return nil, result, fmt.Errorf("error parsing CA bundle: %w", aggErr)
+	}
+	return roots, result, nil
 }
 
 func VerifyChain(certs []*x509.Certificate, ocspStaple []byte, expectedName, caPath string) SimpleVerification {
+	result := SimpleVerification{
+		Chains:         [][]simpleVerifyCert{},
+		OCSPWasStapled: ocspStaple != nil,
+	}
+
+	roots, _, err := LoadRoots(caPath)
+	if err != nil {
+		result.Error = err.Error() + "\n"
+		return result
+	}
+	return VerifyChainWithRoots(certs, ocspStaple, expectedName, roots)
+}
+
+// VerifyChainWithRoots performs verification against an already loaded set
+// of roots. Callers must obtain roots through LoadRoots, which guarantees
+// complete parsing of the CA bundle.
+func VerifyChainWithRoots(certs []*x509.Certificate, ocspStaple []byte, expectedName string, roots *x509.CertPool) SimpleVerification {
 	result := SimpleVerification{
 		Chains:         [][]simpleVerifyCert{},
 		OCSPWasStapled: ocspStaple != nil,
@@ -123,12 +155,6 @@ func VerifyChain(certs []*x509.Certificate, ocspStaple []byte, expectedName, caP
 	intermediates := x509.NewCertPool()
 	for i := 1; i < len(certs); i++ {
 		intermediates.AddCert(certs[i])
-	}
-
-	roots, err := caBundle(caPath)
-	if err != nil {
-		result.Error = err.Error() + "\n"
-		return result
 	}
 	// expectedName could be a hostname or could be a SPIFFE ID (spiffe://...)
 	// x509 package doesn't support verifying SPIFFE IDs. When we're expecting a SPIFFE ID, we tell

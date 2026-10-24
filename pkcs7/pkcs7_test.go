@@ -16,7 +16,9 @@
 package pkcs7
 
 import (
+	"bytes"
 	"encoding/base64"
+	"errors"
 	"testing"
 )
 
@@ -42,5 +44,61 @@ func TestExtract(t *testing.T) {
 	}
 	if len(certs) != 1 {
 		t.Fatalf("expected 1 certs, but found %d", len(certs))
+	}
+}
+
+func TestParseSignedDataStrictSingle(t *testing.T) {
+	envelopes, err := ParseSignedDataStrict(testBlock)
+	if err != nil {
+		t.Fatalf("strict parse failed: %v", err)
+	}
+	if len(envelopes) != 1 {
+		t.Fatalf("expected 1 envelope, but found %d", len(envelopes))
+	}
+}
+
+func TestParseSignedDataStrictConcatenated(t *testing.T) {
+	// Two valid envelopes concatenated must both be reported, with all
+	// bytes consumed.
+	data := bytes.Repeat(testBlock, 2)
+	envelopes, err := ParseSignedDataStrict(data)
+	if err != nil {
+		t.Fatalf("strict parse failed: %v", err)
+	}
+	if len(envelopes) != 2 {
+		t.Fatalf("expected 2 envelopes, but found %d", len(envelopes))
+	}
+}
+
+func TestParseSignedDataStrictTrailingData(t *testing.T) {
+	// A valid envelope followed by garbage must not look like success.
+	data := append(append([]byte{}, testBlock...), 0x00, 0x01, 0x02)
+	envelopes, err := ParseSignedDataStrict(data)
+	if !errors.Is(err, ErrTruncatedSignedData) {
+		t.Fatalf("expected ErrTruncatedSignedData, got %v", err)
+	}
+	if len(envelopes) != 1 {
+		t.Fatalf("expected the valid prefix envelope to be returned, got %d", len(envelopes))
+	}
+}
+
+func TestParseSignedDataStrictEmpty(t *testing.T) {
+	if _, err := ParseSignedDataStrict(nil); err == nil {
+		t.Fatal("expected error for empty input, got nil")
+	}
+	if envelopes, err := ParseSignedDataStrict([]byte{0x30, 0x00}); err == nil {
+		t.Fatalf("expected error for non-signed-data envelope, got %d envelopes", len(envelopes))
+	}
+}
+
+func TestParseSignedDataStrictGarbageOnly(t *testing.T) {
+	// Garbage without a valid prefix is a plain parse error, not a
+	// truncation of a valid envelope prefix.
+	_, err := ParseSignedDataStrict([]byte{0x00, 0x01, 0x02, 0x03})
+	if err == nil {
+		t.Fatal("expected error, got nil")
+	}
+	if errors.Is(err, ErrTruncatedSignedData) {
+		t.Fatalf("plain garbage must not be classified as truncated signed data: %v", err)
 	}
 }

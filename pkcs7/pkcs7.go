@@ -18,6 +18,7 @@ package pkcs7
 import (
 	"crypto/x509"
 	"encoding/asn1"
+	"errors"
 	"fmt"
 )
 
@@ -57,6 +58,36 @@ func ParseSignedData(data []byte) ([]*SignedDataEnvelope, error) {
 	}
 
 	return out, err
+}
+
+// ErrTruncatedSignedData is returned by ParseSignedDataStrict when the input
+// contains one or more valid envelopes followed by unparseable bytes.
+var ErrTruncatedSignedData = errors.New("trailing data after PKCS#7 signed data envelope(s)")
+
+// ParseSignedDataStrict parses one or more concatenated signed data envelopes,
+// requiring that every input byte is consumed. Unlike ParseSignedData, a valid
+// envelope followed by truncated or otherwise invalid data is reported as an
+// error instead of silently returning the successfully parsed prefix.
+func ParseSignedDataStrict(data []byte) ([]*SignedDataEnvelope, error) {
+	var out []*SignedDataEnvelope
+
+	rest := data
+	for len(rest) > 0 {
+		block, remaining, err := parseSignedData(rest)
+		if err != nil {
+			if len(out) > 0 {
+				return out, fmt.Errorf("%w: %s", ErrTruncatedSignedData, err)
+			}
+			return nil, err
+		}
+		out = append(out, block)
+		rest = remaining
+	}
+
+	if len(out) == 0 {
+		return nil, errors.New("no PKCS#7 signed data envelopes found in input")
+	}
+	return out, nil
 }
 
 func parseSignedData(data []byte) (*SignedDataEnvelope, []byte, error) {
